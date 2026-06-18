@@ -32,9 +32,14 @@ import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+# Stable namespace UUID for chunk IDs — derived from a constant so that
+# (doc_id, chunk_index) → UUID is deterministic across re-runs (idempotency).
+_CHUNK_NAMESPACE = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -380,37 +385,44 @@ def ensure_collection(client: QdrantClient, name: str, dim: int) -> None:
 
 
 def make_point_id(doc_id: str, chunk_index: int) -> str:
-    return f"{doc_id}:{chunk_index:04d}"
+    """Deterministic UUID5 from (doc_id, chunk_index).
+
+    Qdrant only accepts UUID or unsigned integer IDs, not arbitrary strings.
+    UUID5 keeps the same input → same output across runs (so re-upserts
+    update existing points instead of creating duplicates).
+    """
+    key = f"{doc_id}:{chunk_index:04d}"
+    return str(uuid.uuid5(_CHUNK_NAMESPACE, key))
 
 
 def upsert_batched(
     client: QdrantClient,
     collection: str,
     points: list[qm.PointStruct],
-    batch_size: int = 64,
+    batch_size: int = 16,
 ) -> int:
-    """Upsert in small batches with retry on transient failures.
+    """Upsert in tiny batches with retry on transient failures.
 
-    Qdrant Cloud's free tier can take 30-90s to accept a batch with many
-    points (especially the first batch, when the collection is being
-    initialized). `wait=False` returns as soon as the server enqueues the
-    batch; indexing happens in the background.
+    Qdrant Cloud free tier is aggressive about per-request throttling, so we
+    send small batches with wait=True (server confirms indexing before we
+    move on). This is slower per-batch but more reliable: the alternative
+    (big batches + wait=False) hits 60-90s timeouts that burn 5 retries each.
     """
     sent = 0
     for i in range(0, len(points), batch_size):
         batch = points[i:i + batch_size]
-        @retry(stop=stop_after_attempt(5),
-               wait=wait_exponential(multiplier=2, min=4, max=60),
+        @retry(stop=stop_after_attempt(8),
+               wait=wait_exponential(multiplier=2, min=3, max=45),
                retry_error_callback=lambda state: (
-                   print(f"  [retry] batch starting at {i}, attempt "
+                   print(f"  [retry] batch {i}-{i+len(batch)} attempt "
                          f"{state.attempt_number}", file=sys.stderr)
                    or None
                ))
         def _send(b=batch):
-            client.upsert(collection_name=collection, points=b, wait=False)
+            client.upsert(collection_name=collection, points=b, wait=True)
         _send()
         sent += len(batch)
-        if (i // batch_size) % 5 == 0:
+        if (sent % 64) < batch_size or sent == len(points):
             print(f"    upserted {sent}/{len(points)}", file=sys.stderr)
     return sent
 
@@ -499,7 +511,7 @@ def process_pdf(
 
     t2 = time.time()
     points = list(build_points(chunks, vectors, rec))
-    sent = upsert_batched(client, collection, points, batch_size=64)
+    sent = upsert_batched(client, collection, points, batch_size=16)
     upsert_secs = time.time() - t2
 
     return {
