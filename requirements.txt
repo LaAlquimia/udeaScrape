@@ -1,0 +1,18 @@
+# Scraping (scrape.py)
+requests>=2.32
+openpyxl>=3.1
+
+# Vectorización (vectorize.py)
+pypdf>=6.0
+python-dotenv>=1.0
+qdrant-client>=1.16
+fastembed>=0.7
+tenacity>=9.0
+# Transitive but pinned here for clarity
+httpx>=0.27
+
+# OCR opcional — solo si quieres vectorizar los PDFs escaneados (sin pypdf text).
+# Requiere además: brew install tesseract tesseract-lang poppler
+# pytesseract>=0.3
+# pdf2image>=1.17
+
